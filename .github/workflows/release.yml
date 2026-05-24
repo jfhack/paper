@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.plat }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            plat: linux-x64
+            fetch: linux-x64
+            platdir: linux-x64
+            lib: libpdfium.so
+          - os: macos-14
+            plat: macos-arm64
+            fetch: mac-arm64
+            platdir: macos-arm64
+            lib: libpdfium.dylib
+          - os: macos-15-intel
+            plat: macos-x64
+            fetch: mac-x64
+            platdir: macos-x64
+            lib: libpdfium.dylib
+          - os: windows-latest
+            plat: win-x64
+            fetch: win-x64
+            platdir: win-x64
+            lib: pdfium.dll
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Fetch PDFium runtime
+        shell: bash
+        run: bash scripts/fetch-pdfium.sh ${{ matrix.fetch }}
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Assemble release directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="dist/paper"
+          mkdir -p "$stage/pdfium-licenses"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "target/release/paper.exe" "$stage/"
+          else
+            cp "target/release/paper" "$stage/"
+          fi
+          libfile="$(find "pdfium/${{ matrix.platdir }}" -name "${{ matrix.lib }}" -type f | head -n 1)"
+          if [ -z "$libfile" ]; then
+            echo "could not find ${{ matrix.lib }} under pdfium/${{ matrix.platdir }}" >&2
+            exit 1
+          fi
+          cp "$libfile" "$stage/"
+          cp "pdfium/${{ matrix.platdir }}/LICENSE" "$stage/pdfium-licenses/" 2>/dev/null || true
+          if [ -d "pdfium/${{ matrix.platdir }}/licenses" ]; then
+            cp -r "pdfium/${{ matrix.platdir }}/licenses/." "$stage/pdfium-licenses/"
+          fi
+          cp LICENSE "$stage/" 2>/dev/null || true
+          cp README.md "$stage/" 2>/dev/null || true
+
+      - name: Archive (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="paper-${{ steps.version.outputs.version }}-${{ matrix.plat }}"
+          tar -C dist -czf "${name}.tar.gz" paper
+          echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "paper-${{ steps.version.outputs.version }}-${{ matrix.plat }}"
+          Compress-Archive -Path dist/paper/* -DestinationPath "$name.zip"
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-${{ matrix.plat }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

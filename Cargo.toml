@@ -1,0 +1,101 @@
+[package]
+name = "paper"
+version = "0.1.0"
+description = "A small tool to help retouch PDFs: modify and add text and images"
+authors = ["Paper contributors"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.78"
+
+[[bin]]
+name = "paper"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence"] }
+egui = "0.29"
+egui_extras = { version = "0.29", default-features = false }
+egui-phosphor = "0.7"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+pdfium-render = { version = "0.8.37", default-features = false, features = ["image_025", "pdfium_latest", "thread_safe"] }
+lopdf = "0.34"
+# Defaults give us the pure-Rust xdg-portal backend + async-std, whose executor
+# works under rfd's blocking API. (The "tokio" feature would need a running
+# Tokio reactor and panics otherwise.) common-controls-v6 is Windows-only.
+rfd = { version = "0.15", features = ["common-controls-v6"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "1"
+# Used to validate embedded font programs before handing them to egui's
+# text layer (egui parses fonts with this same crate and would panic on
+# malformed data). Matches the version epaint already pulls in.
+ab_glyph = "0.2"
+ttf-parser = "0.25"
+serde = { version = "1", features = ["derive"] }
+
+# Windows-only: lets `build.rs` embed `assets/icon.ico` (and version info)
+# into the .exe. Declared per-host so Linux / macOS builds never pull it.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = [
+    "NSAppleEventManager",
+    "NSAppleEventDescriptor",
+    "NSString",
+    "NSURL",
+] }
+
+# Bundle metadata for `cargo bundle` (macOS .app / Linux packages). The
+# packaging stage uses these icons: cargo-bundle builds the macOS iconset
+# from the PNG list, copies the hicolor PNGs on Linux, and the .ico/.icns
+# are available for tools that want them directly. Adjust `identifier` to
+# your own reverse-DNS before shipping.
+[package.metadata.bundle]
+name = "Paper"
+identifier = "org.pdfeditor.paper"
+icon = [
+    "assets/icon_32.png",
+    "assets/icon_48.png",
+    "assets/icon_64.png",
+    "assets/icon_128.png",
+    "assets/icon_256.png",
+    "assets/icon_512.png",
+    "assets/icon.icns",
+    "assets/icon.ico",
+]
+
+[package.metadata.packager]
+product_name = "Paper"
+identifier = "org.pdfeditor.paper"
+icons = [
+    "assets/icon_32.png",
+    "assets/icon_48.png",
+    "assets/icon_64.png",
+    "assets/icon_128.png",
+    "assets/icon_256.png",
+    "assets/icon_512.png",
+    "assets/icon.icns",
+    "assets/icon.ico",
+]
+
+[[package.metadata.packager.file_associations]]
+extensions = ["pdf"]
+mime_type = "application/pdf"
+description = "PDF document"
+name = "PDF document"
+role = "Editor"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
+# Local fork of egui-winit 0.29.1 that keeps IME Commit events on Linux so
+# dead-key composition (´+a → á, ¨+u → ü, …) actually reaches the focused
+# TextEdit. Upstream drops all IME events on Linux because of issue #5008's
+# Preedit duplication bug; we skip Preedit only, not Commit. See
+# `vendor/egui-winit/src/lib.rs` near `WindowEvent::Ime`.
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }
