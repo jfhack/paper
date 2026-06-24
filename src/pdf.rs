@@ -73,6 +73,9 @@ pub struct OverlayEdit {
     pub color: Option<[u8; 3]>,
     pub font_family: Option<String>,
     pub font_embedded_id: Option<(u32, u16)>,
+
+    pub system_font_path: Option<std::path::PathBuf>,
+    pub system_font_index: u32,
     pub image_data: Option<std::sync::Arc<Vec<u8>>>,
 }
 
@@ -81,7 +84,6 @@ pub enum OverlayKind {
     Text,
     Image,
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
@@ -102,7 +104,6 @@ pub struct ObjectInfo {
     pub width: f32,
     pub height: f32,
 }
-
 
 #[derive(Clone, Debug)]
 pub struct PageTextChar {
@@ -163,6 +164,9 @@ pub struct ObjectEdit {
     pub font_size: Option<f32>,
     pub char_spacing: Option<f32>,
     pub word_spacing: Option<f32>,
+
+    pub system_font_path: Option<std::path::PathBuf>,
+    pub system_font_index: u32,
     pub image_data: Option<std::sync::Arc<Vec<u8>>>,
     pub arrange: Option<ArrangeAction>,
     pub delete: bool,
@@ -191,6 +195,8 @@ impl ObjectEdit {
             font_size: None,
             char_spacing: None,
             word_spacing: None,
+            system_font_path: None,
+            system_font_index: 0,
             image_data: None,
             arrange: None,
             delete: false,
@@ -243,7 +249,6 @@ impl ObjectEdit {
             && self.image_data.is_none()
     }
 }
-
 
 enum Cmd {
     Open(PathBuf),
@@ -371,7 +376,6 @@ impl Drop for PdfHandle {
         let _ = self.thread.take();
     }
 }
-
 
 struct Engine {
     doc: Option<PdfDocument<'static>>,
@@ -881,7 +885,6 @@ impl Engine {
     }
 }
 
-
 fn apply_object_edits_to_page(page: &mut PdfPage, edits: &mut Vec<&ObjectEdit>) -> Result<(), PdfiumError> {
     page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
     if page_is_simple(page) {
@@ -1205,7 +1208,6 @@ fn object_kind(t: PdfPageObjectType) -> ObjectKind {
     }
 }
 
-
 fn load_pdfium() -> Result<Pdfium, PdfiumError> {
     for candidate in bundled_pdfium_candidates() {
         if candidate.exists() {
@@ -1260,7 +1262,6 @@ fn pdfium_platform_dir() -> &'static str {
     { "unsupported" }
 }
 
-
 fn export_overlays(
     _pdfium: &Pdfium,
     input: &Path,
@@ -1306,9 +1307,25 @@ fn export_overlays(
         }
     }
     let unicode_font_id = match &unicode_face {
-        Some(face) if !used_gids.is_empty() => Some(build_unicode_font(&mut document, face, &used_gids)?),
+        Some(face) if !used_gids.is_empty() => Some(build_unicode_font(
+            &mut document,
+            UNICODE_FONT_BYTES,
+            UNICODE_FONT_NAME,
+            face,
+            &used_gids,
+        )?),
         _ => None,
     };
+
+    let system_fonts = collect_system_fonts(
+        &mut document,
+        edits.iter().filter_map(|e| match (e.kind, &e.system_font_path, &e.text) {
+            (OverlayKind::Text, Some(path), Some(text)) => {
+                Some((path, e.system_font_index, text.as_str()))
+            }
+            _ => None,
+        }),
+    );
 
     let mut by_page: std::collections::HashMap<usize, Vec<&OverlayEdit>> = std::collections::HashMap::new();
     for e in edits {
@@ -1336,6 +1353,7 @@ fn export_overlays(
                 &font_ids,
                 unicode_font_id,
                 unicode_face.as_ref(),
+                &system_fonts,
             )?;
         }
         if ops.is_empty() {
@@ -1367,6 +1385,7 @@ fn append_edit(
     font_ids: &std::collections::HashMap<&'static str, lopdf::ObjectId>,
     unicode_font_id: Option<lopdf::ObjectId>,
     unicode_face: Option<&ttf_parser::Face>,
+    system_fonts: &std::collections::HashMap<(std::path::PathBuf, u32), SystemFontEntry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let x = origin_x + edit.x;
     let y = top_y - edit.y - edit.height;
@@ -1391,44 +1410,100 @@ fn append_edit(
             let text = edit.text.as_deref().unwrap_or("");
             let font_size = edit.font_size.unwrap_or(18.0).max(4.0);
             let leading = font_size * 1.2;
-            let unicode = match (unicode_font_id, unicode_face) {
-                (Some(uid), Some(face)) if overlay_text_needs_unicode(text) => Some((uid, face)),
+
+            enum Encoder { Standard, Unicode, SystemFont }
+
+            let system_font = edit
+                .system_font_path
+                .as_ref()
+                .and_then(|p| system_fonts.get(&(p.clone(), edit.system_font_index)));
+            let unicode_fallback = match (unicode_font_id, unicode_face) {
+                (Some(uid), Some(face))
+                    if system_font.is_none() && overlay_text_needs_unicode(text) =>
+                {
+                    Some((uid, face))
+                }
                 _ => None,
             };
-            let res: Vec<u8> = if let Some((uid, _)) = unicode {
+
+            let (res_name, encoder): (Vec<u8>, Encoder) = if let Some(sys) = system_font {
+                ensure_page_resource(
+                    document,
+                    page_id,
+                    b"Font",
+                    &sys.resource_name,
+                    Object::Reference(sys.font_object_id),
+                )?;
+                (sys.resource_name.as_bytes().to_vec(), Encoder::SystemFont)
+            } else if let Some((uid, _)) = unicode_fallback {
                 ensure_page_resource(document, page_id, b"Font", "PFUni", Object::Reference(uid))?;
-                b"PFUni".to_vec()
+                (b"PFUni".to_vec(), Encoder::Unicode)
             } else {
                 match edit.font_embedded_id {
                     Some((num, gen)) => {
                         let name = format!("PFEmb{num}_{gen}");
-                        ensure_page_resource(document, page_id, b"Font", &name, Object::Reference((num, gen)))?;
-                        name.into_bytes()
+                        ensure_page_resource(
+                            document,
+                            page_id,
+                            b"Font",
+                            &name,
+                            Object::Reference((num, gen)),
+                        )?;
+                        (name.into_bytes(), Encoder::Standard)
                     }
                     None => {
                         let base = standard_font_base(edit.font_family.as_deref());
                         let r = standard_font_resource(base);
                         if let Some(id) = font_ids.get(base) {
-                            ensure_page_resource(document, page_id, b"Font", r, Object::Reference(*id))?;
+                            ensure_page_resource(
+                                document,
+                                page_id,
+                                b"Font",
+                                r,
+                                Object::Reference(*id),
+                            )?;
                         }
-                        r.as_bytes().to_vec()
+                        (r.as_bytes().to_vec(), Encoder::Standard)
                     }
                 }
             };
+
             push_rgb(ops, color, "rg");
             ops.push(Operation::new("BT", vec![]));
-            ops.push(Operation::new("Tf", vec![Object::Name(res), font_size.into()]));
-            ops.push(Operation::new("Td", vec![0.into(), (height - font_size).into()]));
+            ops.push(Operation::new(
+                "Tf",
+                vec![Object::Name(res_name), font_size.into()],
+            ));
+            ops.push(Operation::new(
+                "Td",
+                vec![0.into(), (height - font_size).into()],
+            ));
+
             for (i, raw_line) in text.split('\n').enumerate() {
                 if i > 0 {
                     ops.push(Operation::new("Td", vec![0.into(), (-leading).into()]));
                 }
                 let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-                let operand = match unicode {
-                    Some((_, face)) => {
-                        Object::String(encode_identity_h(face, line), lopdf::StringFormat::Hexadecimal)
+                let operand = match encoder {
+                    Encoder::SystemFont => {
+                        let sys = system_font.expect("encoder set above");
+                        let face = ttf_parser::Face::parse(&sys.bytes, edit.system_font_index)
+                            .expect("system font bytes were validated");
+                        Object::String(
+                            encode_identity_h(&face, line),
+                            lopdf::StringFormat::Hexadecimal,
+                        )
                     }
-                    None => Object::string_literal(encode_overlay_text_bytes(line)),
+                    Encoder::Unicode => {
+                        let face = unicode_face.expect("unicode encoder requires unicode_face");
+                        Object::String(
+                            encode_identity_h(face, line),
+                            lopdf::StringFormat::Hexadecimal,
+                        )
+                    }
+                    Encoder::Standard => {
+                        Object::string_literal(encode_overlay_text_bytes(line))
+                    }
                 };
                 ops.push(Operation::new("Tj", vec![operand]));
             }
@@ -1625,6 +1700,8 @@ fn encode_identity_h(face: &ttf_parser::Face, text: &str) -> Vec<u8> {
 
 fn build_unicode_font(
     document: &mut Document,
+    font_bytes: &[u8],
+    base_name: &str,
     face: &ttf_parser::Face,
     used_gids: &std::collections::BTreeSet<u16>,
 ) -> Result<lopdf::ObjectId, Box<dyn std::error::Error>> {
@@ -1643,14 +1720,14 @@ fn build_unicode_font(
     let cap_height = face.capital_height().map(|h| scale(h as i32)).unwrap_or(ascent);
 
     let font_file = Stream::new(
-        dictionary! { "Length1" => Object::Integer(UNICODE_FONT_BYTES.len() as i64) },
-        UNICODE_FONT_BYTES.to_vec(),
+        dictionary! { "Length1" => Object::Integer(font_bytes.len() as i64) },
+        font_bytes.to_vec(),
     );
     let font_file_id = document.add_object(font_file);
 
     let descriptor_id = document.add_object(dictionary! {
         "Type" => "FontDescriptor",
-        "FontName" => UNICODE_FONT_NAME,
+        "FontName" => base_name,
         "Flags" => Object::Integer(32),
         "FontBBox" => Object::Array(font_bbox),
         "ItalicAngle" => Object::Integer(0),
@@ -1676,7 +1753,7 @@ fn build_unicode_font(
     let cid_font_id = document.add_object(dictionary! {
         "Type" => "Font",
         "Subtype" => "CIDFontType2",
-        "BaseFont" => UNICODE_FONT_NAME,
+        "BaseFont" => base_name,
         "CIDSystemInfo" => cid_system_info,
         "FontDescriptor" => Object::Reference(descriptor_id),
         "CIDToGIDMap" => "Identity",
@@ -1687,12 +1764,334 @@ fn build_unicode_font(
     let type0_id = document.add_object(dictionary! {
         "Type" => "Font",
         "Subtype" => "Type0",
-        "BaseFont" => UNICODE_FONT_NAME,
+        "BaseFont" => base_name,
         "Encoding" => "Identity-H",
         "DescendantFonts" => Object::Array(vec![Object::Reference(cid_font_id)]),
     });
 
     Ok(type0_id)
+}
+
+#[derive(Clone, Debug)]
+pub struct SystemFont {
+    pub family: String,
+    pub style: String,
+    pub path: std::path::PathBuf,
+    pub face_index: u32,
+}
+
+static SYSTEM_FONTS_CACHE: std::sync::OnceLock<Vec<SystemFont>> = std::sync::OnceLock::new();
+
+pub fn list_system_fonts() -> &'static [SystemFont] {
+    SYSTEM_FONTS_CACHE
+        .get_or_init(enumerate_system_fonts)
+        .as_slice()
+}
+
+fn enumerate_system_fonts() -> Vec<SystemFont> {
+    let mut out: Vec<SystemFont> = Vec::new();
+    for dir in system_font_dirs() {
+        if !dir.exists() {
+            continue;
+        }
+        walk_font_dir(&dir, &mut out);
+    }
+    out.sort_by(|a, b| {
+        a.family
+            .to_ascii_lowercase()
+            .cmp(&b.family.to_ascii_lowercase())
+            .then_with(|| a.style.cmp(&b.style))
+    });
+
+    out.dedup_by(|a, b| a.family == b.family && a.style == b.style);
+    out
+}
+
+fn walk_font_dir(dir: &std::path::Path, out: &mut Vec<SystemFont>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_font_dir(&path, out);
+        } else if is_supported_font_file(&path) {
+            collect_faces_from_file(&path, out);
+        }
+    }
+}
+
+fn is_supported_font_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("ttf") | Some("otf") | Some("ttc") | Some("otc")
+    )
+}
+
+fn collect_faces_from_file(path: &std::path::Path, out: &mut Vec<SystemFont>) {
+    let Ok(data) = std::fs::read(path) else { return };
+    let count = ttf_parser::fonts_in_collection(&data).unwrap_or(1).max(1);
+    for index in 0..count {
+        let Ok(face) = ttf_parser::Face::parse(&data, index) else { continue };
+        if matches!(face.permissions(), Some(ttf_parser::Permissions::Restricted)) {
+            continue;
+        }
+        let (family, style) = read_font_face_names(&face);
+        out.push(SystemFont {
+            family,
+            style,
+            path: path.to_path_buf(),
+            face_index: index,
+        });
+    }
+}
+
+fn read_font_face_names(face: &ttf_parser::Face) -> (String, String) {
+    let mut family = String::new();
+    let mut style = String::new();
+    let mut typo_family = String::new();
+    let mut typo_style = String::new();
+    for name in face.names() {
+        if !name.is_unicode() {
+            continue;
+        }
+        let Some(value) = name.to_string() else {
+            continue;
+        };
+        match name.name_id {
+            ttf_parser::name_id::FAMILY if family.is_empty() => family = value,
+            ttf_parser::name_id::SUBFAMILY if style.is_empty() => style = value,
+            ttf_parser::name_id::TYPOGRAPHIC_FAMILY if typo_family.is_empty() => typo_family = value,
+            ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY if typo_style.is_empty() => typo_style = value,
+            _ => {}
+        }
+    }
+    let family = if !typo_family.is_empty() {
+        typo_family
+    } else if !family.is_empty() {
+        family
+    } else {
+        "Unknown".to_string()
+    };
+    let style = if !typo_style.is_empty() {
+        typo_style
+    } else if !style.is_empty() {
+        style
+    } else {
+        "Regular".to_string()
+    };
+    (family, style)
+}
+
+fn system_font_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = std::path::PathBuf::from(home);
+            dirs.push(home.join(".local").join("share").join("fonts"));
+            dirs.push(home.join(".fonts"));
+        }
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            dirs.push(std::path::PathBuf::from(xdg).join("fonts"));
+        }
+        dirs.push(std::path::PathBuf::from("/usr/local/share/fonts"));
+        dirs.push(std::path::PathBuf::from("/usr/share/fonts"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(std::path::PathBuf::from(home).join("Library").join("Fonts"));
+        }
+        dirs.push(std::path::PathBuf::from("/Library/Fonts"));
+        dirs.push(std::path::PathBuf::from("/System/Library/Fonts"));
+
+        dirs.push(std::path::PathBuf::from("/System/Library/Fonts/Supplemental"));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(root) = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR")) {
+            dirs.push(std::path::PathBuf::from(root).join("Fonts"));
+        }
+
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(
+                std::path::PathBuf::from(local)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Fonts"),
+            );
+        }
+    }
+    dirs
+}
+
+fn system_font_resource_name(index: usize) -> String {
+    format!("PFSys{index}")
+}
+
+struct SystemFontEntry {
+    bytes: Vec<u8>,
+    font_object_id: lopdf::ObjectId,
+    resource_name: String,
+}
+
+fn collect_system_fonts<'a, I>(
+    document: &mut Document,
+    texts: I,
+) -> std::collections::HashMap<(std::path::PathBuf, u32), SystemFontEntry>
+where
+    I: IntoIterator<Item = (&'a std::path::PathBuf, u32, &'a str)>,
+{
+    use std::collections::{BTreeSet, HashMap};
+
+    struct Pending {
+        bytes: Vec<u8>,
+        used_gids: BTreeSet<u16>,
+    }
+    let mut pending: HashMap<(std::path::PathBuf, u32), Pending> = HashMap::new();
+
+    for (path, face_index, text) in texts {
+        let key = (path.clone(), face_index);
+        if !pending.contains_key(&key) {
+            let Ok(bytes) = std::fs::read(path) else { continue };
+            if ttf_parser::Face::parse(&bytes, face_index).is_err() {
+                continue;
+            }
+            pending.insert(
+                key.clone(),
+                Pending {
+                    bytes,
+                    used_gids: BTreeSet::new(),
+                },
+            );
+        }
+        let entry = pending.get_mut(&key).expect("just inserted");
+        let Ok(face) = ttf_parser::Face::parse(&entry.bytes, face_index) else { continue };
+        for c in text.chars() {
+            if c.is_control() {
+                continue;
+            }
+            if let Some(g) = face.glyph_index(c) {
+                entry.used_gids.insert(g.0);
+            }
+        }
+    }
+
+    let mut out: HashMap<(std::path::PathBuf, u32), SystemFontEntry> = HashMap::new();
+    for (idx, (key, pending)) in pending.into_iter().enumerate() {
+        let Ok(face) = ttf_parser::Face::parse(&pending.bytes, key.1) else { continue };
+        let base_name = format!("PaperSys{idx}");
+        let font_object_id = match build_unicode_font(
+            document,
+            &pending.bytes,
+            &base_name,
+            &face,
+            &pending.used_gids,
+        ) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        out.insert(
+            key,
+            SystemFontEntry {
+                bytes: pending.bytes,
+                font_object_id,
+                resource_name: system_font_resource_name(idx),
+            },
+        );
+    }
+    out
+}
+
+struct SystemFontApply {
+    bytes: Vec<u8>,
+    resource_name: String,
+    font_size: f32,
+}
+
+fn set_tj_hex(op: &mut Operation, hex_bytes: &[u8]) {
+    match op.operator.as_str() {
+        "Tj" | "'" => {
+            if let Some(first) = op.operands.first_mut() {
+                *first = Object::String(hex_bytes.to_vec(), lopdf::StringFormat::Hexadecimal);
+            }
+        }
+        "TJ" => {
+            if let Some(first) = op.operands.first_mut() {
+                *first = Object::Array(vec![Object::String(
+                    hex_bytes.to_vec(),
+                    lopdf::StringFormat::Hexadecimal,
+                )]);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn prepare_object_system_fonts(
+    doc: &mut Document,
+    surgical: &HashMap<usize, Vec<(ObjectEdit, Option<(f32, f32)>)>>,
+) -> HashMap<(usize, usize, Option<u32>), SystemFontApply> {
+    let mut texts: Vec<(std::path::PathBuf, u32, String)> = Vec::new();
+    for edits in surgical.values() {
+        for (e, _) in edits {
+            let (Some(p), Some(t)) = (&e.system_font_path, &e.text) else {
+                continue;
+            };
+            texts.push((p.clone(), e.system_font_index, t.clone()));
+        }
+    }
+    if texts.is_empty() {
+        return HashMap::new();
+    }
+    let system_fonts = collect_system_fonts(
+        doc,
+        texts.iter().map(|(p, i, t)| (p, *i, t.as_str())),
+    );
+
+    let pages = doc.get_pages();
+    let mut out: HashMap<(usize, usize, Option<u32>), SystemFontApply> = HashMap::new();
+    for (page_index, edits) in surgical {
+        let Some(page_id) = pages.get(&(*page_index as u32 + 1)).copied() else {
+            continue;
+        };
+        for (edit, _) in edits {
+            let (Some(path), Some(text)) = (&edit.system_font_path, &edit.text) else {
+                continue;
+            };
+            let key = (path.clone(), edit.system_font_index);
+            let Some(entry) = system_fonts.get(&key) else { continue };
+            if ensure_page_resource(
+                doc,
+                page_id,
+                b"Font",
+                &entry.resource_name,
+                Object::Reference(entry.font_object_id),
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let Ok(face) = ttf_parser::Face::parse(&entry.bytes, edit.system_font_index) else {
+                continue;
+            };
+            let bytes = encode_identity_h(&face, text);
+            let font_size = edit.font_size.unwrap_or(12.0);
+            out.insert(
+                (*page_index, edit.object_index, edit.copy_seq),
+                SystemFontApply {
+                    bytes,
+                    resource_name: entry.resource_name.clone(),
+                    font_size,
+                },
+            );
+        }
+    }
+    out
 }
 
 fn standard_font_base(family: Option<&str>) -> &'static str {
@@ -1979,7 +2378,6 @@ fn push_rgb(ops: &mut Vec<Operation>, c: [u8; 3], op: &str) {
     ops.push(Operation::new(op, vec![r.into(), g.into(), b.into()]));
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Mat6 {
     a: f32,
@@ -2219,7 +2617,8 @@ fn plan_edits(doc: &PdfDocument<'_>, by_page: HashMap<usize, Vec<ObjectEdit>>) -
             .iter()
             .any(|e| e.char_spacing.is_some() || e.word_spacing.is_some());
         let has_dupes = edits.iter().any(|e| e.copy_seq.is_some());
-        let fragile = has_delete || has_alpha || has_spacing || has_dupes || !page_is_simple(&page);
+        let has_system_font = edits.iter().any(|e| e.system_font_path.is_some());
+        let fragile = has_delete || has_alpha || has_spacing || has_dupes || has_system_font || !page_is_simple(&page);
         let all_surgical = edits.iter().all(is_surgical_eligible);
         if fragile && all_surgical {
             let with_centres: Vec<(ObjectEdit, Option<(f32, f32)>)> = edits
@@ -2409,6 +2808,7 @@ fn apply_surgical_edits_to_doc_with_encoded(
     surgical: &HashMap<usize, Vec<(ObjectEdit, Option<(f32, f32)>)>>,
     encoded_text: &HashMap<(usize, usize, Option<u32>), (Vec<u8>, String)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let system_text = prepare_object_system_fonts(doc, surgical);
     let pages = doc.get_pages();
     for (page_index, edits) in surgical {
         let Some(page_id) = pages.get(&(*page_index as u32 + 1)).copied() else { continue };
@@ -2455,6 +2855,9 @@ fn apply_surgical_edits_to_doc_with_encoded(
                     .and_then(|seq| dup_gs.get(&(dup.object_index, seq)))
                     .map(|s| s.as_str());
                 let mut out = Vec::new();
+                let sys = dup
+                    .copy_seq
+                    .and_then(|seq| system_text.get(&(*page_index, dup.object_index, Some(seq))));
                 emit_normalized_object_with_encoded(
                     &mut out,
                     obj,
@@ -2463,6 +2866,7 @@ fn apply_surgical_edits_to_doc_with_encoded(
                     Some((dup, *centre)),
                     enc.map(|(b, t)| (b.as_slice(), t.as_str())),
                     gs,
+                    sys,
                 );
                 if obj.kind == ObjectKind::Image {
                     if let Some(data) = &dup.image_data {
@@ -2526,6 +2930,7 @@ fn apply_surgical_edits_to_doc_with_encoded(
                 let obj = objects[edit.object_index];
                 let encoded = encoded_text.get(&(*page_index, edit.object_index, None));
                 let gs = gs_names.get(&edit.object_index).map(|s| s.as_str());
+                let sys = system_text.get(&(*page_index, edit.object_index, None));
                 splice_surgical_edit_with_encoded(
                     &mut content.operations,
                     &obj,
@@ -2533,6 +2938,7 @@ fn apply_surgical_edits_to_doc_with_encoded(
                     *centre,
                     encoded.map(|(b, t)| (b.as_slice(), t.as_str())),
                     gs,
+                    sys,
                 );
                 changed = true;
             }
@@ -2554,8 +2960,26 @@ fn apply_surgical_edits_to_doc_with_encoded(
                 .filter(|((p, _, seq), _)| p == page_index && seq.is_none())
                 .map(|((_, obj_idx, _), entry)| (*obj_idx, entry.clone()))
                 .collect();
-            content.operations =
-                rebuild_normalized_with_encoded(&content.operations, &normal_edits, &page_encoded, &gs_names);
+            let mut page_system_text: HashMap<usize, SystemFontApply> = HashMap::new();
+            for ((p, obj_idx, seq), sys) in system_text.iter() {
+                if p == page_index && seq.is_none() {
+                    page_system_text.insert(
+                        *obj_idx,
+                        SystemFontApply {
+                            bytes: sys.bytes.clone(),
+                            resource_name: sys.resource_name.clone(),
+                            font_size: sys.font_size,
+                        },
+                    );
+                }
+            }
+            content.operations = rebuild_normalized_with_encoded(
+                &content.operations,
+                &normal_edits,
+                &page_encoded,
+                &gs_names,
+                &page_system_text,
+            );
             changed = true;
         }
         if !dup_blocks.is_empty() {
@@ -2688,13 +3112,12 @@ fn rebuild_normalized(
     ops: &[Operation],
     edits: &[(ObjectEdit, Option<(f32, f32)>)],
 ) -> Vec<Operation> {
-    rebuild_normalized_with_encoded(ops, edits, &HashMap::new(), &HashMap::new())
+    rebuild_normalized_with_encoded(ops, edits, &HashMap::new(), &HashMap::new(), &HashMap::new())
 }
 
 fn transform_point(x: f32, y: f32, m: &Mat6) -> (f32, f32) {
     (x * m.a + y * m.c + m.e, x * m.b + y * m.d + m.f)
 }
-
 
 fn transform_path_ops(ops: &[Operation], m: &Mat6) -> Vec<Operation> {
     let mut out = Vec::with_capacity(ops.len());
@@ -2778,6 +3201,7 @@ fn rebuild_normalized_with_encoded(
     edits: &[(ObjectEdit, Option<(f32, f32)>)],
     encoded_text: &HashMap<usize, (Vec<u8>, String)>,
     gs_names: &HashMap<usize, String>,
+    system_text: &HashMap<usize, SystemFontApply>,
 ) -> Vec<Operation> {
     let (objects, snapshots) = walk_with_snapshots(ops);
     let n = objects.len();
@@ -2813,7 +3237,8 @@ fn rebuild_normalized_with_encoded(
         let edit_opt = edits_by_idx.get(&orig_idx).map(|t| (t.0, t.1));
         let enc = encoded_text.get(&orig_idx).map(|(b, t)| (b.as_slice(), t.as_str()));
         let gs = gs_names.get(&orig_idx).map(|s| s.as_str());
-        emit_normalized_object_with_encoded(&mut out, obj, snap, ops, edit_opt, enc, gs);
+        let sys = system_text.get(&orig_idx);
+        emit_normalized_object_with_encoded(&mut out, obj, snap, ops, edit_opt, enc, gs, sys);
     }
 
     out
@@ -3056,7 +3481,7 @@ fn emit_normalized_object(
     src_ops: &[Operation],
     edit: Option<(&ObjectEdit, Option<(f32, f32)>)>,
 ) {
-    emit_normalized_object_with_encoded(out, obj, snap, src_ops, edit, None, None);
+    emit_normalized_object_with_encoded(out, obj, snap, src_ops, edit, None, None, None);
 }
 
 fn emit_normalized_object_with_encoded(
@@ -3067,6 +3492,7 @@ fn emit_normalized_object_with_encoded(
     edit: Option<(&ObjectEdit, Option<(f32, f32)>)>,
     encoded_text: Option<(&[u8], &str)>,
     gs_name: Option<&str>,
+    system_font: Option<&SystemFontApply>,
 ) {
     let (edit, centre) = match edit {
         Some(x) => x,
@@ -3079,6 +3505,8 @@ fn emit_normalized_object_with_encoded(
                 scale_x: 1.0,
                 scale_y: 1.0,
                 rotation: 0.0,
+                system_font_path: None,
+                system_font_index: 0,
                 flip_horizontal: false,
                 flip_vertical: false,
                 text: None,
@@ -3222,7 +3650,16 @@ fn emit_normalized_object_with_encoded(
         ));
         if let Some(op) = src_ops.get(obj.op_start).cloned() {
             let mut shown = op;
-            if let Some(new_text) = &edit.text {
+            if let Some(sys) = system_font {
+                out.push(Operation::new(
+                    "Tf",
+                    vec![
+                        Object::Name(sys.resource_name.as_bytes().to_vec()),
+                        Object::Real(sys.font_size.max(0.5)),
+                    ],
+                ));
+                set_tj_hex(&mut shown, &sys.bytes);
+            } else if let Some(new_text) = &edit.text {
                 if let Some((bytes, orig)) = encoded_text {
                     replace_text_operand_bytes(
                         &mut shown,
@@ -3299,7 +3736,7 @@ fn splice_surgical_edit(
     edit: &ObjectEdit,
     page_centre: Option<(f32, f32)>,
 ) {
-    splice_surgical_edit_with_encoded(ops, obj, edit, page_centre, None, None);
+    splice_surgical_edit_with_encoded(ops, obj, edit, page_centre, None, None, None);
 }
 
 fn splice_surgical_edit_with_encoded(
@@ -3309,13 +3746,18 @@ fn splice_surgical_edit_with_encoded(
     page_centre: Option<(f32, f32)>,
     encoded_text: Option<(&[u8], &str)>,
     gs_name: Option<&str>,
+    system_font: Option<&SystemFontApply>,
 ) {
     if obj.op_end > ops.len() {
         return;
     }
 
-    if let Some(new_text) = &edit.text {
-        if obj.kind == ObjectKind::Text {
+    if obj.kind == ObjectKind::Text {
+        if let Some(sys) = system_font {
+            if let Some(op) = ops.get_mut(obj.op_start) {
+                set_tj_hex(op, &sys.bytes);
+            }
+        } else if let Some(new_text) = &edit.text {
             if let Some(op) = ops.get_mut(obj.op_start) {
                 if let Some((bytes, orig)) = encoded_text {
                     replace_text_operand_bytes(
@@ -3356,6 +3798,7 @@ fn splice_surgical_edit_with_encoded(
     let has_spacing = (edit.char_spacing.is_some() || edit.word_spacing.is_some())
         && obj.kind == ObjectKind::Text;
     let has_alpha = gs_name.is_some();
+    let has_system_font = system_font.is_some() && obj.kind == ObjectKind::Text;
     if !has_transform
         && !has_fill
         && !has_stroke
@@ -3363,6 +3806,7 @@ fn splice_surgical_edit_with_encoded(
         && !has_font_size
         && !has_spacing
         && !has_alpha
+        && !has_system_font
     {
         return;
     }
@@ -3413,7 +3857,17 @@ fn splice_surgical_edit_with_encoded(
     if let Some(w) = edit.stroke_width {
         prefix.push(Operation::new("w", vec![Object::Real(w.max(0.0))]));
     }
-    if let Some(new_size) = edit.font_size {
+    if let Some(sys) = system_font {
+        if obj.kind == ObjectKind::Text {
+            prefix.push(Operation::new(
+                "Tf",
+                vec![
+                    Object::Name(sys.resource_name.as_bytes().to_vec()),
+                    Object::Real(sys.font_size.max(0.5)),
+                ],
+            ));
+        }
+    } else if let Some(new_size) = edit.font_size {
         if obj.kind == ObjectKind::Text {
             if let Some(font_name) = find_current_font_name(ops, obj.op_start) {
                 prefix.push(Operation::new(
@@ -4093,6 +4547,8 @@ mod tests {
             color: Some([0, 0, 0]),
             font_family: Some("Helvetica".into()),
             font_embedded_id: None,
+            system_font_path: None,
+            system_font_index: 0,
             image_data: None,
         };
         export_overlays(&pdfium, &input, &output, &[edit]).unwrap();
@@ -4180,6 +4636,8 @@ mod tests {
             color: Some([0, 0, 0]),
             font_family: Some("LucidaGrande".into()),
             font_embedded_id: Some((999, 0)),
+            system_font_path: None,
+            system_font_index: 0,
             image_data: None,
         };
         export_overlays(&pdfium, &input, &output, &[edit]).unwrap();
@@ -4198,6 +4656,122 @@ mod tests {
             found_type0,
             "non-Latin text should embed the Unicode font even when a document font is selected"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_fonts_enumeration_returns_non_empty_list() {
+
+        let fonts = list_system_fonts();
+        assert!(
+            !fonts.is_empty(),
+            "expected at least one parseable system font in standard directories"
+        );
+    }
+
+    #[test]
+    fn overlay_export_embeds_chosen_system_font() {
+
+        let bundled = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("DejaVuSans.ttf");
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, Vec::new()));
+        doc.objects.insert(
+            page_id,
+            dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 400.into(), 600.into()],
+                "Resources" => dictionary! {},
+                "Contents" => content_id,
+            }
+            .into(),
+        );
+        doc.objects.insert(
+            pages_id,
+            dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1 }.into(),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let dir = std::env::temp_dir().join(format!("paper-sysfont-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.pdf");
+        let output = dir.join("out.pdf");
+        doc.save(&input).unwrap();
+
+        let pdfium = match load_pdfium() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let edit = OverlayEdit {
+            page_index: 0,
+            kind: OverlayKind::Text,
+            x: 10.0,
+            y: 15.0,
+            width: 200.0,
+            height: 40.0,
+            ref_width: 200.0,
+            ref_height: 40.0,
+            rotation: 0.0,
+            flip_horizontal: false,
+            flip_vertical: false,
+
+            text: Some("Hello, Привет".into()),
+            font_size: Some(18.0),
+            color: Some([0, 0, 0]),
+            font_family: Some("Helvetica".into()),
+            font_embedded_id: None,
+
+            system_font_path: Some(bundled),
+            system_font_index: 0,
+            image_data: None,
+        };
+        export_overlays(&pdfium, &input, &output, &[edit]).unwrap();
+
+        let exported = Document::load(&output).unwrap();
+
+        let mut found = false;
+        for obj in exported.objects.values() {
+            let Object::Dictionary(d) = obj else { continue };
+            let sub = d.get(b"Subtype").ok().and_then(|o| o.as_name().ok());
+            let enc = d.get(b"Encoding").ok().and_then(|o| o.as_name().ok());
+            let base = d.get(b"BaseFont").ok().and_then(|o| o.as_name().ok());
+            if sub.map(|n| n == &b"Type0"[..]).unwrap_or(false)
+                && enc.map(|n| n == &b"Identity-H"[..]).unwrap_or(false)
+                && base.map(|n| n == &b"PaperSys0"[..]).unwrap_or(false)
+            {
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "expected a Type0/Identity-H font named PaperSys0 in the exported PDF"
+        );
+
+        let (_, page_id) = exported.get_pages().into_iter().next().unwrap();
+        let content = Content::decode(&exported.get_page_content(page_id).unwrap()).unwrap();
+        let tj_hex = content
+            .operations
+            .iter()
+            .find_map(|op| {
+                if op.operator != "Tj" {
+                    return None;
+                }
+                match op.operands.first() {
+                    Some(Object::String(b, lopdf::StringFormat::Hexadecimal)) if !b.is_empty() => {
+                        Some(b.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .expect("expected a non-empty hex Tj from the system-font path");
+        assert_eq!(tj_hex.len() % 2, 0, "identity-h uses two bytes per glyph");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4253,6 +4827,8 @@ mod tests {
             color: Some([0, 0, 0]),
             font_family: Some("Helvetica".into()),
             font_embedded_id: None,
+            system_font_path: None,
+            system_font_index: 0,
             image_data: None,
         };
         export_overlays(&pdfium, &input, &output, &[edit]).unwrap();
@@ -4315,6 +4891,8 @@ mod tests {
             color: Some([0, 0, 0]),
             font_family: Some("Helvetica".into()),
             font_embedded_id: None,
+            system_font_path: None,
+            system_font_index: 0,
             image_data: None,
         };
         export_overlays(&pdfium, &input, &output, &[edit]).unwrap();
@@ -4457,6 +5035,7 @@ mod tests {
             Some((0.0, 0.0)),
             None,
             Some("PFa0"),
+            None,
         );
         let operators: Vec<&str> = ops.iter().map(|o| o.operator.as_str()).collect();
         assert_eq!(operators, vec!["q", "gs", "rg", "m", "l", "S", "Q"]);
@@ -4483,6 +5062,7 @@ mod tests {
             &objs[0],
             &edit,
             Some((0.0, 0.0)),
+            None,
             None,
             None,
         );
@@ -4514,6 +5094,7 @@ mod tests {
             &objs[0],
             &edit,
             Some((0.0, 0.0)),
+            None,
             None,
             None,
         );
@@ -5296,6 +5877,8 @@ mod tests {
             color: Some([0, 0, 0]),
             font_family: Some("Helvetica".into()),
             font_embedded_id: None,
+            system_font_path: None,
+            system_font_index: 0,
             image_data: None,
         };
         export_overlays(&pdfium, &input, &output, &[edit]).unwrap();

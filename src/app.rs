@@ -31,6 +31,12 @@ const MIN_EDIT_SIZE: f32 = 6.0;
 
 const SETTINGS_KEY: &str = "paper_settings";
 
+#[derive(Clone, Copy)]
+enum SystemFontPickerTarget {
+    Overlay(usize),
+    Object(usize, usize),
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Settings {
@@ -46,7 +52,6 @@ impl Default for Settings {
 const FONT_FAMILIES: [&str; 3] = ["Helvetica", "Times-Roman", "Courier"];
 
 const THUMB_W: f32 = 140.0;
-
 
 struct PageView {
     texture: Option<TextureHandle>,
@@ -251,6 +256,9 @@ pub struct PaperApp {
     about_icon: Option<TextureHandle>,
     show_settings: bool,
     settings: Settings,
+
+    system_font_picker_for: Option<SystemFontPickerTarget>,
+    system_font_picker_search: String,
     image_cache: HashMap<usize, TextureHandle>,
 
     show_thumbnails: bool,
@@ -337,6 +345,8 @@ impl PaperApp {
             about_icon: None,
             show_settings: false,
             settings,
+            system_font_picker_for: None,
+            system_font_picker_search: String::new(),
             image_cache: HashMap::new(),
             show_thumbnails: true,
             thumbs: Vec::new(),
@@ -765,7 +775,6 @@ impl PaperApp {
         }
     }
 
-
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1002,6 +1011,8 @@ impl PaperApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
             let recents = &mut self.recent_colors;
             let eyedropper = &mut self.eyedropper;
+
+            let system_font_picker_for = &mut self.system_font_picker_for;
             let edit = &mut self.edits[idx];
             ui.heading(match edit.kind {
                 OverlayKind::Text => "Text block",
@@ -1140,6 +1151,42 @@ impl PaperApp {
                             }
                         }
                     }
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("System font (embedded)").strong());
+                    ui.small(
+                        egui::RichText::new(format!(
+                            "{}  Pick a font installed on this computer and embed it in the PDF.\n\
+                                 The exported file is self-contained but larger.",
+                            ph::INFO
+                        ))
+                        .color(egui::Color32::from_rgb(70, 130, 180)),
+                    );
+                    let current_sys_label = match &edit.system_font_path {
+                        Some(p) => p
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| p.display().to_string()),
+                        None => "(none)".to_string(),
+                    };
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(format!("Choose system font…  ({current_sys_label})"))
+                            .clicked()
+                        {
+                            *system_font_picker_for =
+                                Some(SystemFontPickerTarget::Overlay(idx));
+                        }
+                        if edit.system_font_path.is_some()
+                            && ui.button("Clear").clicked()
+                        {
+                            edit.system_font_path = None;
+                            edit.system_font_index = 0;
+                        }
+                    });
+
                     if !embedded_fonts.is_empty() {
                         ui.add_space(6.0);
                         ui.separator();
@@ -2279,6 +2326,8 @@ impl PaperApp {
                 color: Some([17, 24, 39]),
                 font_family: Some("Helvetica".to_string()),
                 font_embedded_id: None,
+                system_font_path: None,
+                system_font_index: 0,
                 image_data: None,
             },
             OverlayKind::Image => OverlayEdit {
@@ -2298,6 +2347,8 @@ impl PaperApp {
                 color: None,
                 font_family: None,
                 font_embedded_id: None,
+                system_font_path: None,
+                system_font_index: 0,
                 image_data: None,
             },
         };
@@ -2342,6 +2393,8 @@ impl PaperApp {
             color: None,
             font_family: None,
             font_embedded_id: None,
+            system_font_path: None,
+            system_font_index: 0,
             image_data: Some(Arc::new(bytes)),
         });
         Some(self.edits.len() - 1)
@@ -2403,6 +2456,83 @@ impl PaperApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if cancel {
             self.confirm_close = false;
+        }
+    }
+
+    fn system_font_picker_dialog(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.system_font_picker_for else { return };
+        let mut open = true;
+
+        let mut picked: Option<(std::path::PathBuf, u32)> = None;
+        egui::Window::new("Choose a system font")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(440.0)
+            .default_height(480.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.small(
+                    "Picks an OS-installed font; the file is embedded into the PDF on export, \
+so the document is self-contained.",
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.system_font_picker_search)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Search by family or style…"),
+                );
+                let query = self.system_font_picker_search.to_ascii_lowercase();
+                let fonts = crate::pdf::list_system_fonts();
+                ui.small(format!(
+                    "{} fonts installed",
+                    fonts.len(),
+                ));
+                ui.separator();
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                    for font in fonts {
+                        let label = format!("{} — {}", font.family, font.style);
+
+                        if !query.is_empty()
+                            && !label.to_ascii_lowercase().contains(&query)
+                        {
+                            continue;
+                        }
+                        if ui.selectable_label(false, &label).clicked() {
+                            picked = Some((font.path.clone(), font.face_index));
+                        }
+                    }
+                });
+            });
+
+        if let Some((path, face_index)) = picked {
+            self.apply_system_font_pick(target, path, face_index);
+            self.system_font_picker_for = None;
+        } else if !open {
+            self.system_font_picker_for = None;
+        }
+    }
+
+    fn apply_system_font_pick(
+        &mut self,
+        target: SystemFontPickerTarget,
+        path: std::path::PathBuf,
+        face_index: u32,
+    ) {
+        match target {
+            SystemFontPickerTarget::Overlay(idx) => {
+                if let Some(edit) = self.edits.get_mut(idx) {
+                    edit.system_font_path = Some(path);
+                    edit.system_font_index = face_index;
+                }
+            }
+            SystemFontPickerTarget::Object(page, obj) => {
+                let edit = self
+                    .object_edits
+                    .entry((page, obj))
+                    .or_insert_with(|| ObjectEdit::new(page, obj));
+                edit.system_font_path = Some(path);
+                edit.system_font_index = face_index;
+                self.object_edits_dirty = true;
+            }
         }
     }
 
@@ -2762,6 +2892,39 @@ impl PaperApp {
                             .color(egui::Color32::from_rgb(180, 130, 30)),
                         );
                     }
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("System font (embedded)").strong());
+                    ui.small(
+                        egui::RichText::new(format!(
+                            "{}  Pick a font installed on this computer and embed it.\n\
+                                 Useful when the document's font is missing glyphs you want to type.",
+                            ph::INFO
+                        ))
+                        .color(egui::Color32::from_rgb(70, 130, 180)),
+                    );
+                    let current_sys_label = match &next.system_font_path {
+                        Some(p) => p
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| p.display().to_string()),
+                        None => "(none)".to_string(),
+                    };
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(format!("Choose system font…  ({current_sys_label})"))
+                            .clicked()
+                        {
+                            self.system_font_picker_for =
+                                Some(SystemFontPickerTarget::Object(page, oi));
+                        }
+                        if next.system_font_path.is_some() && ui.button("Clear").clicked() {
+                            next.system_font_path = None;
+                            next.system_font_index = 0;
+                        }
+                    });
                 }
                 ui.horizontal(|ui| {
                     ui.label("Z-order:");
@@ -3473,6 +3636,7 @@ impl eframe::App for PaperApp {
         self.confirm_open_dialog(ctx);
         self.about_dialog(ctx);
         self.settings_dialog(ctx);
+        self.system_font_picker_dialog(ctx);
 
         if let Some(path) = ctx.input(|i| {
             i.raw
@@ -4055,7 +4219,6 @@ fn overlay_preview_family(
     preview_font_family(edit.font_family.as_deref(), serif)
 }
 
-
 fn rot(v: Vec2, angle_rad: f32) -> Vec2 {
     let (s, c) = angle_rad.sin_cos();
     Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
@@ -4209,7 +4372,6 @@ fn cursor_for(h: Handle) -> CursorIcon {
     }
 }
 
-
 fn draw_edit(
     ui: &egui::Ui,
     page_rect: Rect,
@@ -4322,7 +4484,6 @@ fn draw_edit(
         chrome.circle_stroke(rot_h, HANDLE_PX, Stroke::new(1.2, ACCENT));
     }
 }
-
 
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
